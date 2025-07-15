@@ -5,76 +5,77 @@ from trendspy import Trends
 from google.cloud import bigquery
 import gspread
 from google.oauth2.service_account import Credentials
-from flask import Flask, jsonify, make_response
 
-# Initialize Flask app
-
-app = Flask(__name__)
-
-# Core pipeline logic
 def fetch_and_store():
-     project_id    = os.environ["PROJECT_ID"]
-     dataset_id    = os.environ["DATASET"]
-     table_id      = os.environ["TABLE"]
-     locale        = os.environ.get("LOCALE", "US")
-     today_str     = date.today().isoformat()
-     region        = "US"
+    # ─── Configuration ─────────────────────────────────────────
+    project_id    = os.environ["PROJECT_ID"]
+    dataset_id    = os.environ["DATASET"]
+    table_id      = os.environ["TABLE"]
+    locale        = os.environ.get("LOCALE", "US")
+    today_str     = date.today().isoformat()
+    region        = "US"  # change if your BQ dataset is elsewhere
 
-     SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-     SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")
+    # Google Sheets config
+    SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+    SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")
 
-     # Fetch trending
-     tr = Trends()
-     try:
-         trend_list = tr.trending_now(geo=locale)
-     except Exception as e:
-         return {"status": "error", "message": f"Failed fetch: {e}"}, 500
+    # ─── 1) Fetch raw trending searches ────────────────────────
+    tr = Trends()
+    try:
+        trend_list = tr.trending_now(geo=locale)
+    except Exception as e:
+        print(f"❌ failed to fetch trending_now(): {e}")
+        return
 
-     rows = []
-     for t in trend_list:
-         vol = t.volume
-         if isinstance(vol, str):
-             vol = int(vol.replace(",", ""))
-         rows.append({
-             "trend_date": today_str,
-             "keyword": t.keyword,
-             "value": vol
-         })
-     df = pd.DataFrame(rows)
-     if df.empty:
-         return {"status": "warning", "message": "No trends fetched."}, 200
+    # Build DataFrame of raw results
+    rows = []
+    for t in trend_list:
+        vol = t.volume
+        if isinstance(vol, str):
+            vol = int(vol.replace(",", ""))
+        rows.append({
+            "trend_date": today_str,
+            "keyword":     t.keyword,
+            "value":       vol
+        })
+    df = pd.DataFrame(rows)
 
-     # BigQuery insert
-     bq = bigquery.Client(project=project_id, location=region)
-     table_ref = bq.dataset(dataset_id).table(table_id)
-     bq.get_dataset(f"{project_id}.{dataset_id}")
-     errors = bq.insert_rows_json(table_ref, df.to_dict(orient="records"))
-     if errors:
-         return {"status": "error", "message": f"BQ insert errors: {errors}"}, 500
+    if df.empty:
+        print("⚠️ No trends fetched.")
+        return
 
-     # Google Sheets update
-     creds = Credentials.from_service_account_file(
-         os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
-         scopes=["https://www.googleapis.com/auth/spreadsheets"]
-     )
-     gc = gspread.authorize(creds)
-     sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-     header = ["trend_date", "keyword", "value"]
-     values = [header] + df[header].values.tolist()
-     sheet.clear()
-     sheet.update(values)
+    print("✅ Raw Trending Searches:\n")
+    print(df.to_string(index=False))
 
-     return {"status": "success", "inserted_rows": len(df)}, 200
+    # ─── 2) Stream‑insert into BigQuery ──────────────────────
+    bq = bigquery.Client(project=project_id, location=region)
+    table_ref = bq.dataset(dataset_id).table(table_id)
 
-# Flask route to trigger pipeline
+    # verify dataset exists
+    bq.get_dataset(f"{project_id}.{dataset_id}")
 
-@app.route("/", methods=["GET"])
+    bq_rows = df.to_dict(orient="records")
+    errors = bq.insert_rows_json(table_ref, bq_rows)
+    if errors:
+        raise RuntimeError(f"BigQuery insert errors: {errors}")
+    print(f"✅ Inserted {len(bq_rows)} rows into {project_id}.{dataset_id}.{table_id}")
 
-def trigger():
-    result, status = fetch_and_store()
-    response = make_response(jsonify(result), status)
-    return response
+    # ─── 3) Append to Google Sheet ───────────────────────────
+    creds = Credentials.from_service_account_file(
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+    # Prepare values: header + data
+    header = ["trend_date", "keyword", "value"]
+    values = [header] + df[header].values.tolist()
+
+    # Overwrite existing content
+    sheet.clear()
+    sheet.update(values)
+    print(f"✅ Pushed {len(df)} rows to Google Sheet '{SHEET_NAME}'.")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    fetch_and_store()
